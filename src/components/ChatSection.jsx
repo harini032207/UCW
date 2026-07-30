@@ -73,13 +73,18 @@ const ChatSection = () => {
     }
   };
 
-  // 3. Initialize WebSocket Connection
+  // 3. Initialize WebSocket Connection (UPDATED WITH DUPLICATE & RE-RENDER FIX)
   useEffect(() => {
     const userId = currentUser?.user_id || currentUser?.id;
     
     if (!userId) {
       console.warn('[WEBSOCKET_DEBUG] Skipping WS connection: No User ID found', currentUser);
       return;
+    }
+
+    // React Strict Mode double-connection prevention
+    if (socketRef.current) {
+      socketRef.current.close();
     }
 
     const wsUrl = `ws://localhost:8000/ws/chat/${userId}`;
@@ -100,14 +105,21 @@ const ChatSection = () => {
         const currentUserId = String(currentUser?.user_id || currentUser?.id);
         const incomingSenderId = String(data.sender_id);
 
-        // Update chat only if message belongs to current active window user
+        // 🔥 FIX 1: Send panna aale instant-a local UI-la append pannidhala, 
+        // WebSocket return payload-a echo aagama block panrom.
+        if (incomingSenderId === currentUserId) return;
+
         setActiveChat((currentActive) => {
           if (currentActive && String(currentActive.other_user_id) === incomingSenderId) {
             setChatHistory((prev) => {
-              // Duplicate message rendering fix
-              if (data.message_id && prev.some((m) => m.id === data.message_id)) return prev;
+              // 🔥 FIX 2: Strict Duplicate message verification
+              const isDuplicate = prev.some(
+                (m) => (m.id && data.message_id && m.id === data.message_id) || 
+                       (m.text === (data.content || data.text) && String(m.sender_id) === incomingSenderId)
+              );
 
-              const isMe = incomingSenderId === currentUserId;
+              if (isDuplicate) return prev;
+
               const formattedTime = data.created_at
                 ? new Date(data.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
                 : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -116,7 +128,7 @@ const ChatSection = () => {
                 ...prev,
                 {
                   id: data.message_id || Date.now(),
-                  sender: isMe ? 'me' : 'other',
+                  sender: 'other',
                   text: data.content || data.text,
                   time: formattedTime,
                   sender_id: data.sender_id,
@@ -143,7 +155,7 @@ const ChatSection = () => {
     return () => {
       if (ws) ws.close();
     };
-  }, [currentUser]);
+  }, [currentUser?.user_id || currentUser?.id]); // 🔥 Primitive dependency to prevent socket recreating on full user object re-render
 
   // 4. Load Chat History from Database for Selected User
   const handleSelectChat = async (conn) => {
