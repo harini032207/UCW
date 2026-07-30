@@ -1,10 +1,11 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Send, Phone, Video, Info, MessageSquareDashed, UserPlus } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const WS_BASE_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000';
 
 const ChatSection = () => {
   const router = useRouter();
@@ -17,6 +18,7 @@ const ChatSection = () => {
 
   const socketRef = useRef(null);
   const messagesEndRef = useRef(null);
+  const reconnectTimeoutRef = useRef(null);
 
   // Auto scroll to latest message
   const scrollToBottom = () => {
@@ -73,28 +75,24 @@ const ChatSection = () => {
     }
   };
 
-  // 3. Initialize WebSocket Connection (UPDATED WITH DUPLICATE & RE-RENDER FIX)
-  useEffect(() => {
+  // 3. Resilient WebSocket Connection Handler with Auto Reconnect
+  const connectWebSocket = useCallback(() => {
     const userId = currentUser?.user_id || currentUser?.id;
-    
-    if (!userId) {
-      console.warn('[WEBSOCKET_DEBUG] Skipping WS connection: No User ID found', currentUser);
+    if (!userId) return;
+
+    if (socketRef.current && (socketRef.current.readyState === WebSocket.OPEN || socketRef.current.readyState === WebSocket.CONNECTING)) {
       return;
     }
 
-    // React Strict Mode double-connection prevention
-    if (socketRef.current) {
-      socketRef.current.close();
-    }
-
-    const wsUrl = `ws://localhost:8000/ws/chat/${userId}`;
-    console.log('[WEBSOCKET_DEBUG] Attempting to connect to:', wsUrl);
+    const wsUrl = `${WS_BASE_URL}/ws/chat/${userId}`;
+    console.log('[WEBSOCKET_DEBUG] Connecting to:', wsUrl);
 
     const ws = new WebSocket(wsUrl);
     socketRef.current = ws;
 
     ws.onopen = () => {
-      console.log('✅ [WEBSOCKET_SUCCESS] Connection Opened!');
+      console.log('✅ [WEBSOCKET_SUCCESS] Connection Established!');
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
     };
 
     ws.onmessage = (event) => {
@@ -105,17 +103,16 @@ const ChatSection = () => {
         const currentUserId = String(currentUser?.user_id || currentUser?.id);
         const incomingSenderId = String(data.sender_id);
 
-        // 🔥 FIX 1: Send panna aale instant-a local UI-la append pannidhala, 
-        // WebSocket return payload-a echo aagama block panrom.
+        // Prevent echoing own sent message payload back from socket
         if (incomingSenderId === currentUserId) return;
 
         setActiveChat((currentActive) => {
           if (currentActive && String(currentActive.other_user_id) === incomingSenderId) {
             setChatHistory((prev) => {
-              // 🔥 FIX 2: Strict Duplicate message verification
               const isDuplicate = prev.some(
-                (m) => (m.id && data.message_id && m.id === data.message_id) || 
-                       (m.text === (data.content || data.text) && String(m.sender_id) === incomingSenderId)
+                (m) =>
+                  (m.id && data.message_id && m.id === data.message_id) ||
+                  (m.text === (data.content || data.text) && String(m.sender_id) === incomingSenderId)
               );
 
               if (isDuplicate) return prev;
@@ -132,8 +129,8 @@ const ChatSection = () => {
                   text: data.content || data.text,
                   time: formattedTime,
                   sender_id: data.sender_id,
-                  receiver_id: data.receiver_id
-                }
+                  receiver_id: data.receiver_id,
+                },
               ];
             });
           }
@@ -145,23 +142,35 @@ const ChatSection = () => {
     };
 
     ws.onerror = (err) => {
-      console.error('❌ [WEBSOCKET_ERROR] Connection failure:', err);
+      console.error('❌ [WEBSOCKET_ERROR]', err);
     };
 
     ws.onclose = (evt) => {
       console.log(`🔌 [WEBSOCKET_CLOSED] Code: ${evt.code}, Reason: ${evt.reason}`);
+      // Auto-reconnect after 3 seconds if disconnected abruptly
+      if (evt.code !== 1000) {
+        reconnectTimeoutRef.current = setTimeout(() => {
+          console.log('🔄 Reconnecting WebSocket...');
+          connectWebSocket();
+        }, 3000);
+      }
     };
+  }, [currentUser?.user_id, currentUser?.id]);
+
+  useEffect(() => {
+    connectWebSocket();
 
     return () => {
-      if (ws) ws.close();
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      if (socketRef.current) socketRef.current.close(1000, 'Component unmounted');
     };
-  }, [currentUser?.user_id || currentUser?.id]); // 🔥 Primitive dependency to prevent socket recreating on full user object re-render
+  }, [connectWebSocket]);
 
-  // 4. Load Chat History from Database for Selected User
+  // 4. Load Chat History for Selected User
   const handleSelectChat = async (conn) => {
     setActiveChat(conn);
     setChatHistory([
-      { id: 'sys-init', sender: 'system', text: `ENCRYPTED SESSION INITIALIZED WITH @${conn.other_username}`, time: 'SYSTEM' }
+      { id: 'sys-init', sender: 'system', text: `ENCRYPTED SESSION INITIALIZED WITH @${conn.other_username}`, time: 'SYSTEM' },
     ]);
 
     try {
@@ -182,12 +191,12 @@ const ChatSection = () => {
           text: msg.content,
           time: new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
           sender_id: msg.sender_id,
-          receiver_id: msg.receiver_id
+          receiver_id: msg.receiver_id,
         }));
 
         setChatHistory([
           { id: 'sys-init', sender: 'system', text: `ENCRYPTED SESSION INITIALIZED WITH @${conn.other_username}`, time: 'SYSTEM' },
-          ...formattedHistory
+          ...formattedHistory,
         ]);
       }
     } catch (err) {
@@ -208,14 +217,12 @@ const ChatSection = () => {
       sender_id: currentUserId,
       receiver_id: activeChat.other_user_id,
       content: textToSend,
-      created_at: new Date().toISOString()
+      created_at: new Date().toISOString(),
     };
 
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      // 1. Send via WebSocket
       socketRef.current.send(JSON.stringify(payload));
 
-      // 2. Immediate local UI append for Sender
       setChatHistory((prev) => [
         ...prev,
         {
@@ -224,13 +231,14 @@ const ChatSection = () => {
           text: textToSend,
           time: nowTime,
           sender_id: currentUserId,
-          receiver_id: activeChat.other_user_id
-        }
+          receiver_id: activeChat.other_user_id,
+        },
       ]);
 
       setMsgInput('');
     } else {
-      console.error('[WEBSOCKET_ERROR] WebSocket is not connected.');
+      console.error('[WEBSOCKET_ERROR] Connection not active. Attempting reconnection...');
+      connectWebSocket();
     }
   };
 
@@ -272,7 +280,6 @@ const ChatSection = () => {
 
   return (
     <div className="w-full h-full flex flex-col pt-4 pb-24 px-4 overflow-hidden">
-
       {/* ─── Active Connections Bar ─────────────────────────────── */}
       <div className="mb-5">
         <h3 className="text-white font-black mb-3 ml-1 uppercase tracking-widest text-xs font-mono border-b border-white/20 pb-2">
@@ -290,13 +297,16 @@ const ChatSection = () => {
                 key={conn.connection_id}
                 onClick={() => handleSelectChat(conn)}
                 className={`shrink-0 w-[95px] border-2 p-2 transition-all text-left cursor-pointer
-                            ${active
-                    ? 'bg-white text-black border-white'
-                    : 'bg-black text-white border-white/30 hover:border-white'}`}
+                           ${
+                             active
+                               ? 'bg-white text-black border-white'
+                               : 'bg-black text-white border-white/30 hover:border-white'
+                           }`}
               >
-                {/* Avatar / Initials block */}
-                <div className={`w-full h-10 flex items-center justify-center font-black font-mono text-lg overflow-hidden
-                                 ${active ? 'bg-black text-white' : 'bg-white text-black'}`}>
+                <div
+                  className={`w-full h-10 flex items-center justify-center font-black font-mono text-lg overflow-hidden
+                             ${active ? 'bg-black text-white' : 'bg-white text-black'}`}
+                >
                   {avatarUrl ? (
                     <img src={avatarUrl} alt={displayName} className="w-full h-full object-cover" />
                   ) : (
@@ -312,16 +322,19 @@ const ChatSection = () => {
         </div>
       </div>
 
-      {/* ─── Main Chat ───────────────────────────────────── */}
+      {/* ─── Main Chat Section ───────────────────────────────────── */}
       {activeChat && (
         <div className="flex-1 brutalist-panel flex flex-col overflow-hidden min-h-0">
-
           {/* Chat Header */}
           <div className="px-4 py-3 border-b-2 border-white flex justify-between items-center bg-black shrink-0">
             <div className="flex items-center gap-3">
               <div className="w-9 h-9 bg-white text-black flex items-center justify-center font-black font-mono text-sm overflow-hidden border border-white">
                 {formatAvatarUrl(activeChat.other_profile_photo) ? (
-                  <img src={formatAvatarUrl(activeChat.other_profile_photo)} alt={activeChat.other_username} className="w-full h-full object-cover" />
+                  <img
+                    src={formatAvatarUrl(activeChat.other_profile_photo)}
+                    alt={activeChat.other_username}
+                    className="w-full h-full object-cover"
+                  />
                 ) : (
                   activeChat.other_username.substring(0, 2).toUpperCase()
                 )}
@@ -358,13 +371,19 @@ const ChatSection = () => {
               const isMe = msg.sender === 'me';
               return (
                 <div key={msg.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'}`}>
-                  <div className={`max-w-[80%] border-2 p-3
-                                   ${isMe
-                      ? 'bg-white text-black border-white'
-                      : 'bg-black text-white border-white'}`}>
+                  <div
+                    className={`max-w-[80%] border-2 p-3
+                               ${
+                                 isMe
+                                   ? 'bg-white text-black border-white'
+                                   : 'bg-black text-white border-white'
+                               }`}
+                  >
                     <p className="font-mono text-sm leading-relaxed whitespace-pre-wrap">{msg.text}</p>
-                    <p className={`text-[10px] mt-2 font-mono font-bold border-t pt-1
-                                   ${isMe ? 'border-black/20 text-black/50' : 'border-white/20 text-white/40'}`}>
+                    <p
+                      className={`text-[10px] mt-2 font-mono font-bold border-t pt-1
+                                 ${isMe ? 'border-black/20 text-black/50' : 'border-white/20 text-white/40'}`}
+                    >
                       TS:&nbsp;{msg.time}
                     </p>
                   </div>

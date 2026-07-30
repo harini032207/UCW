@@ -3,15 +3,15 @@ import sys
 import uuid
 import traceback
 import shutil
-from typing import List, Optional,Dict
+import datetime
+from typing import List, Optional, Dict
 from pathlib import Path
-from fastapi import FastAPI, Depends, HTTPException, status, Query, Request, File, UploadFile
+from fastapi import FastAPI, Depends, HTTPException, status, Query, Request, File, UploadFile, WebSocket, WebSocketDisconnect, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import json
 
 backend_dir = Path(__file__).resolve().parent
@@ -26,7 +26,7 @@ import auth
 # Initialize FastAPI App
 app = FastAPI(
     title="Nexus Auth & Social API",
-    description="Python FastAPI service with User Search, Profiles, Connection Requests, and Notifications",
+    description="Python FastAPI service with User Search, Profiles, Connection Requests, Notifications, Chat Persistence, and Post Feeds",
     version="1.0.0"
 )
 
@@ -209,7 +209,7 @@ def get_me(current_user: models.User = Depends(auth.get_current_user)):
     return current_user
 
 # ----------------------------------------------------
-# 6. User Search Endpoint (Phase 4)
+# 6. User Search Endpoint
 # ----------------------------------------------------
 @app.get("/api/users/search", response_model=List[schemas.UserSearchResult])
 def search_users(
@@ -232,7 +232,7 @@ def search_users(
     return users
 
 # ----------------------------------------------------
-# 7. User Suggestions Endpoint (Must be before {username} route)
+# 7. User Suggestions Endpoint
 # ----------------------------------------------------
 @app.get("/api/users/suggestions", response_model=List[schemas.UserSearchResult])
 def get_user_suggestions(
@@ -245,7 +245,7 @@ def get_user_suggestions(
     return query.limit(5).all()
 
 # ----------------------------------------------------
-# 8. User Public Profile Endpoint (Phase 4)
+# 8. User Public Profile Endpoint
 # ----------------------------------------------------
 @app.get("/api/users/{username}", response_model=schemas.UserProfileResponse)
 def get_user_profile(
@@ -299,7 +299,7 @@ def get_user_profile(
     }
 
 # ----------------------------------------------------
-# 8. User Profile Update Endpoint
+# 9. User Profile Update Endpoint
 # ----------------------------------------------------
 @app.put("/api/users/profile", response_model=schemas.UserResponse)
 def update_profile(
@@ -332,7 +332,7 @@ def update_profile(
     return current_user
 
 # ----------------------------------------------------
-# 9. Image Upload Endpoint
+# 10. Image Upload Endpoint
 # ----------------------------------------------------
 @app.post("/api/upload/image")
 async def upload_image(file: UploadFile = File(...)):
@@ -349,7 +349,7 @@ async def upload_image(file: UploadFile = File(...)):
     return {"url": f"/uploads/{unique_filename}"}
 
 # ----------------------------------------------------
-# 10. Connection Request Endpoint (Phase 5)
+# 11. Connection Request Endpoint
 # ----------------------------------------------------
 @app.post("/api/connections/request", response_model=schemas.ConnectionResponse)
 def send_connection_request(
@@ -380,7 +380,6 @@ def send_connection_request(
         elif existing_conn.status == "PENDING":
             raise HTTPException(status_code=400, detail="CONNECTION_REQUEST_ALREADY_PENDING")
         else:
-            # Re-send if previously rejected
             existing_conn.sender_id = current_user.user_id
             existing_conn.receiver_id = payload.receiver_id
             existing_conn.status = "PENDING"
@@ -420,7 +419,7 @@ def send_connection_request(
     }
 
 # ----------------------------------------------------
-# 11. Accept Connection Endpoint (Phase 5)
+# 12. Accept Connection Endpoint
 # ----------------------------------------------------
 @app.post("/api/connections/accept", response_model=schemas.ConnectionResponse)
 def accept_connection(
@@ -469,7 +468,7 @@ def accept_connection(
     }
 
 # ----------------------------------------------------
-# 12. Reject Connection Endpoint (Phase 5)
+# 13. Reject Connection Endpoint
 # ----------------------------------------------------
 @app.post("/api/connections/reject")
 def reject_connection(
@@ -489,7 +488,7 @@ def reject_connection(
     return {"status": "REJECTED", "connection_id": conn.connection_id}
 
 # ----------------------------------------------------
-# 13. Pending Connection Requests List Endpoint
+# 14. Pending Connection Requests List Endpoint
 # ----------------------------------------------------
 @app.get("/api/connections/pending", response_model=List[schemas.ConnectionResponse])
 def get_pending_connections(
@@ -521,7 +520,7 @@ def get_pending_connections(
     return result
 
 # ----------------------------------------------------
-# 14. Accepted Connections List Endpoint
+# 15. Accepted Connections List Endpoint
 # ----------------------------------------------------
 @app.get("/api/connections/list", response_model=List[schemas.ConnectionResponse])
 def get_accepted_connections(
@@ -557,7 +556,7 @@ def get_accepted_connections(
     return result
 
 # ----------------------------------------------------
-# 15. Notifications List Endpoint
+# 16. Notifications List Endpoint
 # ----------------------------------------------------
 @app.get("/api/notifications", response_model=List[schemas.NotificationResponse])
 def get_notifications(
@@ -589,7 +588,7 @@ def get_notifications(
     return result
 
 # ----------------------------------------------------
-# 16. Mark Notifications as Read Endpoint
+# 17. Mark Notifications as Read Endpoint
 # ----------------------------------------------------
 @app.put("/api/notifications/read")
 def mark_notifications_read(
@@ -605,9 +604,55 @@ def mark_notifications_read(
     db.commit()
 
     return {"status": "success"}
+
+# ----------------------------------------------------
+# 18. FETCH HISTORICAL CHAT MESSAGES
+# ----------------------------------------------------
+@app.get("/api/chat/history/{other_user_id}")
+def get_chat_history(
+    other_user_id: str,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="NOT_AUTHENTICATED")
+
+    c_uid = current_user.user_id
+    o_uid = uuid.UUID(other_user_id)
+
+    # Mark incoming messages as read when chat room is opened
+    db.query(models.Message).filter(
+        models.Message.sender_id == o_uid,
+        models.Message.receiver_id == c_uid,
+        models.Message.is_read == False
+    ).update({"is_read": True})
+    db.commit()
+
+    # Query all messages exchanged between current user and other user
+    messages = db.query(models.Message).filter(
+        or_(
+            and_(models.Message.sender_id == c_uid, models.Message.receiver_id == o_uid),
+            and_(models.Message.sender_id == o_uid, models.Message.receiver_id == c_uid)
+        )
+    ).order_by(models.Message.created_at.asc()).all()
+
+    return [
+        {
+            "message_id": str(msg.message_id),
+            "sender_id": str(msg.sender_id),
+            "receiver_id": str(msg.receiver_id),
+            "content": msg.content,
+            "is_read": msg.is_read,
+            "created_at": msg.created_at.isoformat()
+        }
+        for msg in messages
+    ]
+
+# ----------------------------------------------------
+# 19. WEBSOCKET REALTIME CHAT & PERSISTENCE
+# ----------------------------------------------------
 class ConnectionManager:
     def __init__(self):
-        # Store dict: { "user_id": websocket_instance }
         self.active_connections: Dict[str, WebSocket] = {}
 
     async def connect(self, user_id: str, websocket: WebSocket):
@@ -625,26 +670,202 @@ manager = ConnectionManager()
 @app.websocket("/ws/chat/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
     await manager.connect(str(user_id), websocket)
+    db = database.SessionLocal()
+    
     try:
         while True:
             raw_data = await websocket.receive_text()
             print(f"📩 RECEIVED FROM {user_id}: {raw_data}")
             
             try:
-                # Parse incoming string to JSON
                 data = json.loads(raw_data)
-                receiver_id = str(data.get("receiver_id"))
-                
-                # 1. Receiver-ku message anuppu (Online-la irundha)
-                if receiver_id in manager.active_connections:
-                    receiver_ws = manager.active_connections[receiver_id]
-                    await receiver_ws.send_text(raw_data)
-                    print(f"🚀 DELIVERED TO RECEIVER: {receiver_id}")
-                else:
-                    print(f"⚠️ RECEIVER {receiver_id} IS OFFLINE (Saved to DB only)")
+                sender_id_str = str(data.get("sender_id", user_id))
+                receiver_id_str = str(data.get("receiver_id"))
+                content = data.get("content")
+
+                if sender_id_str and receiver_id_str and content:
+                    s_uuid = uuid.UUID(sender_id_str)
+                    r_uuid = uuid.UUID(receiver_id_str)
+
+                    # 1. Persistent Save: Add to Message Table
+                    new_msg = models.Message(
+                        message_id=uuid.uuid4(),
+                        sender_id=s_uuid,
+                        receiver_id=r_uuid,
+                        content=content,
+                        is_read=False
+                    )
+                    db.add(new_msg)
+
+                    # 2. Notification Table: Entry for receiver
+                    sender_user = db.query(models.User).filter(models.User.user_id == s_uuid).first()
+                    sender_name = sender_user.display_name or sender_user.username if sender_user else "Someone"
+
+                    notif = models.Notification(
+                        notification_id=uuid.uuid4(),
+                        user_id=r_uuid,
+                        sender_id=s_uuid,
+                        type="NEW_MESSAGE",
+                        message=f"{sender_name}: {content[:30]}...",
+                        is_read=False
+                    )
+                    db.add(notif)
+                    db.commit()
+                    db.refresh(new_msg)
+
+                    # 3. Build enriched response payload
+                    payload = {
+                        "event_type": "CHAT_MESSAGE",
+                        "message_id": str(new_msg.message_id),
+                        "sender_id": str(new_msg.sender_id),
+                        "receiver_id": str(new_msg.receiver_id),
+                        "content": new_msg.content,
+                        "is_read": new_msg.is_read,
+                        "created_at": new_msg.created_at.isoformat()
+                    }
+
+                    # 4. Deliver live to Receiver via WebSocket if Online
+                    if receiver_id_str in manager.active_connections:
+                        receiver_ws = manager.active_connections[receiver_id_str]
+                        await receiver_ws.send_text(json.dumps(payload))
+                        print(f"🚀 DELIVERED TO RECEIVER: {receiver_id_str}")
+                    else:
+                        print(f"⚠️ RECEIVER {receiver_id_str} IS OFFLINE (Saved to DB)")
 
             except Exception as e:
-                print(f"❌ Error processing message: {e}")
+                print(f"❌ Error processing message logic: {e}")
+                db.rollback()
 
     except WebSocketDisconnect:
         manager.disconnect(str(user_id))
+    finally:
+        db.close()
+
+
+# ----------------------------------------------------
+# 20. POST FEED & LIKE SYSTEM ENDPOINTS
+# ----------------------------------------------------
+@app.post("/api/posts/create")
+async def create_post(
+    content: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="NOT_AUTHENTICATED")
+
+    if not content and not file:
+        raise HTTPException(status_code=400, detail="POST_CANNOT_BE_EMPTY")
+
+    image_url = None
+    if file:
+        if not file.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="INVALID_FILE_TYPE")
+        file_ext = Path(file.filename).suffix or ".jpg"
+        unique_filename = f"{uuid.uuid4()}{file_ext}"
+        file_path = uploads_dir / unique_filename
+        
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        image_url = f"/uploads/{unique_filename}"
+
+    new_post = models.Post(
+        id=str(uuid.uuid4()),
+        user_id=current_user.user_id,
+        content=content.strip() if content else "",
+        image_url=image_url,
+        created_at=datetime.datetime.utcnow()
+    )
+    db.add(new_post)
+    db.commit()
+    db.refresh(new_post)
+
+    return {
+        "id": str(new_post.id),
+        "author_id": str(current_user.user_id),
+        "author_name": current_user.display_name or current_user.username,
+        "author_username": current_user.username,
+        "author_photo": current_user.profile_photo,
+        "content": new_post.content,
+        "image_url": new_post.image_url,
+        "likes_count": 0,
+        "comments_count": 0,
+        "is_liked": False,
+        "created_at": new_post.created_at.isoformat()
+    }
+
+
+@app.get("/api/posts/feed")
+def get_feed(
+    db: Session = Depends(database.get_db),
+    current_user: Optional[models.User] = Depends(auth.get_current_user)
+):
+    posts = db.query(models.Post).order_by(models.Post.created_at.desc()).limit(50).all()
+    feed_data = []
+
+    for post in posts:
+        author = db.query(models.User).filter(models.User.user_id == post.user_id).first()
+        likes_count = getattr(post, "likes_count", 0) or 0
+        comments_count = getattr(post, "comments_count", 0) or 0
+        
+        is_liked = False
+        if current_user and hasattr(models, "PostLike"):
+            like_exists = db.query(models.PostLike).filter(
+                and_(models.PostLike.post_id == post.id, models.PostLike.user_id == current_user.user_id)
+            ).first()
+            is_liked = bool(like_exists)
+
+        feed_data.append({
+            "id": str(post.id),
+            "author_id": str(author.user_id) if author else None,
+            "author_name": author.display_name or author.username if author else "Unknown",
+            "author_username": author.username if author else "unknown",
+            "author_photo": author.profile_photo if author else None,
+            "content": post.content,
+            "image_url": post.image_url,
+            "likes_count": likes_count,
+            "comments_count": comments_count,
+            "is_liked": is_liked,
+            "created_at": post.created_at.isoformat() if post.created_at else None
+        })
+
+    return feed_data
+
+
+@app.post("/api/posts/{post_id}/like")
+def toggle_like(
+    post_id: str,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="NOT_AUTHENTICATED")
+
+    post = db.query(models.Post).filter(models.Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="POST_NOT_FOUND")
+
+    is_liked = False
+    if hasattr(models, "PostLike"):
+        like_entry = db.query(models.PostLike).filter(
+            and_(models.PostLike.post_id == post_id, models.PostLike.user_id == current_user.user_id)
+        ).first()
+
+        if like_entry:
+            db.delete(like_entry)
+            post.likes_count = max(0, (post.likes_count or 1) - 1)
+            is_liked = False
+        else:
+            new_like = models.PostLike(
+                id=str(uuid.uuid4()),
+                post_id=post_id,
+                user_id=current_user.user_id
+            )
+            db.add(new_like)
+            post.likes_count = (post.likes_count or 0) + 1
+            is_liked = True
+
+        db.commit()
+
+    return {"likes_count": getattr(post, "likes_count", 0), "is_liked": is_liked}
