@@ -3,7 +3,7 @@ import sys
 import uuid
 import traceback
 import shutil
-from typing import List, Optional
+from typing import List, Optional,Dict
 from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, status, Query, Request, File, UploadFile
 from fastapi.responses import JSONResponse
@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import json
 
 backend_dir = Path(__file__).resolve().parent
 if str(backend_dir) not in sys.path:
@@ -603,3 +605,46 @@ def mark_notifications_read(
     db.commit()
 
     return {"status": "success"}
+class ConnectionManager:
+    def __init__(self):
+        # Store dict: { "user_id": websocket_instance }
+        self.active_connections: Dict[str, WebSocket] = {}
+
+    async def connect(self, user_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[str(user_id)] = websocket
+        print(f"✅ USER CONNECTED: {user_id}")
+
+    def disconnect(self, user_id: str):
+        if str(user_id) in self.active_connections:
+            del self.active_connections[str(user_id)]
+            print(f"🔌 USER DISCONNECTED: {user_id}")
+
+manager = ConnectionManager()
+
+@app.websocket("/ws/chat/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    await manager.connect(str(user_id), websocket)
+    try:
+        while True:
+            raw_data = await websocket.receive_text()
+            print(f"📩 RECEIVED FROM {user_id}: {raw_data}")
+            
+            try:
+                # Parse incoming string to JSON
+                data = json.loads(raw_data)
+                receiver_id = str(data.get("receiver_id"))
+                
+                # 1. Receiver-ku message anuppu (Online-la irundha)
+                if receiver_id in manager.active_connections:
+                    receiver_ws = manager.active_connections[receiver_id]
+                    await receiver_ws.send_text(raw_data)
+                    print(f"🚀 DELIVERED TO RECEIVER: {receiver_id}")
+                else:
+                    print(f"⚠️ RECEIVER {receiver_id} IS OFFLINE (Saved to DB only)")
+
+            except Exception as e:
+                print(f"❌ Error processing message: {e}")
+
+    except WebSocketDisconnect:
+        manager.disconnect(str(user_id))

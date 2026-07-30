@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-
+from sqlalchemy import create_engine
 # Ensure backend directory is in sys.path
 backend_dir = Path(__file__).resolve().parent
 if str(backend_dir) not in sys.path:
@@ -31,7 +31,9 @@ engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
     pool_size=10,
-    max_overflow=20
+    max_overflow=20,
+    pool_recycle=300,         # Connections reset every 5 mins
+    connect_args={"connect_timeout": 10}
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
